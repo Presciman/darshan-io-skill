@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "darshan-io-tools"
+version = "1.0.0"
+description = "Exact number retrieval and the two-layer Darshan schema for LLM agents that analyse Darshan I/O logs"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = ["darshan>=3.4.4"]
+
+[project.scripts]
+darshan-tools = "darshan_tools.cli:main"
+darshan-tools-mcp = "darshan_tools.mcp_server:main"
+
+[tool.setuptools]
+packages = ["darshan_tools", "darshan_tools.schema"]
+
+[tool.setuptools.package-data]
+"darshan_tools.schema" = ["darshan_schema.yaml"]

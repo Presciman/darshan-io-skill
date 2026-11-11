@@ -1,0 +1,560 @@
+# =============================================================================
+# Darshan Metrics Schema
+# -----------------------------------------------------------------------------
+# Organized by the logical hierarchy a user reasons about:
+#
+#   application                 (what software -- identity, science domain, I/O stack)
+#   job                         (this run of it -- who/when/how big)
+#   system                      (the machine -- hardware specs, scheduler, rated peak)
+#   modules:                    (how it did I/O -- one category per interface)
+#     POSIX_IO / STDIO / MPIIO / HDF5 / PNETCDF
+#       -> volume / operations / access_pattern / access_sizes /
+#          timing / rank_balance         (what users care about)
+#   storage:                    (where it landed)
+#     LUSTRE
+#   traces:                     (fine-grained, when enabled)
+#     DXT / HEATMAP
+#   insights:                   (derived answers)
+#
+# Each metric: name -> { type, unit, desc }. Metric names are the raw Darshan
+# counter names, so this doubles as a lookup table for agents parsing logs.
+# =============================================================================
+
+meta:
+  name: darshan
+  version: 4
+  description: >
+    Human-readable, agent-consumable catalog of what Darshan measures, grouped
+    by I/O interface and, within each, by the question the metric answers.
+  conventions:
+    source: "Where a field's value comes from, and the difference between evidence and assertion. log = read out of the .darshan header or a counter record; derived = computed or inferred at ingest from the batch environment, the host list or the job script; config = looked up from a per-machine spec table and NEVER observed for this run. Module counters carry no source because they are all log by construction."
+    rank: "-1 = shared-file aggregate across all ranks; >=0 = a single rank (file-per-process)."
+    prefix_F: "Counter names containing _F_ are floating-point (times/timestamps); others are integer counts."
+    size_buckets: "Histogram buckets: 0_100, 100_1K, 1K_10K, 10K_100K, 100K_1M, 1M_4M, 4M_10M, 10M_100M, 100M_1G, 1G_PLUS."
+    counter_overlaps: "POSIX_OPENS INCLUDES POSIX_FILENOS and POSIX_DUPS; STDIO_OPENS includes STDIO_FDOPENS. darshan-parser prints these as WARNINGs and v2 of this schema dropped them, so readers added FILENOS to OPENS and every per-open figure doubled. Distinct open() calls = POSIX_OPENS - POSIX_FILENOS - POSIX_DUPS, published as insights.behavior.distinct_opens."
+    alignment_counters: "A *_ALIGNMENT counter is the configured alignment BOUNDARY IN BYTES -- a setting, not a fault; a small value is not itself a defect. A *_NOT_ALIGNED counter is the NUMBER OF OPERATIONS that were not aligned, and is the one that indicates a problem. They live in their own `alignment` group so the pair cannot be read as one kind of thing."
+    sentinels: "A counter value of -1 means NOT AVAILABLE in this reduction -- it is not a measurement of minus one, and must never be reported, averaged or compared as a number. Rank-scoped picks (*_FASTEST_RANK, *_SLOWEST_RANK, *_FASTEST_RANK_BYTES, *_SLOWEST_RANK_BYTES) and *_MMAPS carry it most often, because libdarshan-util re-derives them from per-rank state a --total reduction no longer holds. meta.unavailable_counters lists every sentinel in a given document, so 'absent' never has to be inferred from 'minus one'."
+    counter_reliability: "Darshan derives MAX_BYTE_{READ|WRITTEN}, CONSEC_{READS|WRITES}, SEQ_{READS|WRITES}, {MEM|FILE}_NOT_ALIGNED and STRIDE*_STRIDE from file offsets, and warns that all of them may be incorrect when one file is reached through both POSIX and STDIO (fileno()/fdopen()). meta.reliability.offset_counters evaluates that condition FOR THE LOG IN HAND -- POSIX_FILENOS > 0 or STDIO_FDOPENS > 0 -- and names the affected counters. This is strictly better than the text dump, which prints the warning only on the parser versions that carry it."
+    module_presence: "A module appears under modules/storage/traces only if the log carries it. presence: instrumented = it also contributed records; presence: instrumented_no_records = it was instrumented but contributed no records to this reduction, which is NOT the same as the job not using that interface. A module absent from the log has no key at all. LUSTRE is commonly instrumented_no_records in a --total reduction -- reading that as 'no Lustre' is the error this field exists to prevent."
+
+# -----------------------------------------------------------------------------
+# APPLICATION -- what software ran, independent of any single run. Some fields
+# come straight from the log (exe_path, shell, linked libraries); the rest are
+# ENRICHED -- parsed or inferred by the ingest/agent pipeline and used to group
+# many jobs of the same code together. Marked source: {log, derived}.
+# -----------------------------------------------------------------------------
+application:
+  fields:
+    app_name:        { type: string, unit: text,  source: derived, desc: "Canonical application name (e.g. WRF, GROMACS, LAMMPS, E3SM), parsed from exe/args or a mapping table." }
+    exe_path:        { type: string, unit: text,  source: log,     desc: "Full executable path -- argv[0] of the header exe line." }
+    shell:           { type: string, unit: text,  source: log,     desc: "Command-line arguments -- the header exe line minus argv[0]." }
+    app_version:     { type: string, unit: text,  source: derived, desc: "Application version, if discoverable from path/args/metadata." }
+    science_domain:  { type: string, unit: text,  source: derived, desc: "Domain/field (climate, molecular dynamics, CFD, cosmology, AI/ML, ...)." }
+    io_libraries:    { type: list,   unit: text,  source: log,     desc: "I/O stack actually exercised, from which modules are present (POSIX, STDIO, MPIIO, HDF5, PnetCDF)." }
+    io_library_versions: { type: map, unit: kv,   source: log,     desc: "Library versions from header metadata (e.g. lib_ver, hdf5 ver) when present." }
+    tags:            { type: list,   unit: text,  source: derived, desc: "Free-form labels for grouping/search (project, campaign, benchmark suite)." }
+
+# -----------------------------------------------------------------------------
+# JOB -- one execution of the application: who ran it, when, and at what shape.
+# Everything here is read straight out of the .darshan header EXCEPT num_nodes
+# and nprocs_per_node, which are derived from the batch env or the DXT
+# hostnames. Read `source` per field: it is the difference between "the log
+# says 32 ranks" and "we worked out 4 nodes".
+# -----------------------------------------------------------------------------
+job:
+  fields:
+    jobid:           { type: int,    unit: id,      source: log, desc: "Scheduler job ID." }
+    uid:             { type: int,    unit: id,      source: log, desc: "User ID." }
+    nprocs_total:    { type: int,    unit: count,   source: log, desc: "Total MPI ranks in the job." }
+    # The run's shape lives with the run. Unlike everything else in `job` these
+    # two are NOT read from the header -- num_nodes comes from PBS/SLURM env or
+    # the unique DXT hostnames, and nprocs_per_node is nprocs_total / num_nodes.
+    # Hence source: derived, and both are null when the log carries no DXT and
+    # no batch environment is supplied.
+    num_nodes:       { type: int,    unit: count,   source: derived, desc: "Compute nodes allocated (unique hosts in the DXT hostnames, or PBS_NUM_NODES)." }
+    nprocs_per_node: { type: int,    unit: count,   source: derived, desc: "MPI ranks per node (nprocs_total / num_nodes); drives per-node I/O contention." }
+    start_time:      { type: int,    unit: epoch,   source: log, desc: "Job start (wall clock)." }
+    end_time:        { type: int,    unit: epoch,   source: log, desc: "Job end (wall clock)." }
+    run_time:        { type: float,  unit: seconds, source: log, desc: "Total runtime." }
+    darshan_version: { type: string, unit: text,    source: log, desc: "Darshan tool version." }
+    log_version:     { type: string, unit: text,    source: log, desc: "Log format version." }
+    darshan_metadata: { type: map,   unit: kv,      source: log, desc: "Header key/value annotations (lib_ver, custom keys)." }
+    fs_mount:        { type: list,   unit: table,   source: log, desc: "Mount points -> filesystem types (lustre|gpfs|nfs|...)." }
+
+# -----------------------------------------------------------------------------
+# SYSTEM -- the machine this run landed on, and what that machine can do. The
+# run's own shape (nprocs_total, num_nodes, nprocs_per_node) lives in `job`;
+# what is here describes the hardware, the scheduler and the performance
+# envelope, none of which Darshan records. So nothing here is `log`:
+# it is ENRICHED from the environment or LOOKED UP. Marked source: {derived, config}.
+#   log     -> present in the .darshan header/metadata
+#   derived -> captured at ingest from batch env (SLURM/PBS), MPI runtime, or job script
+#   config  -> looked up from a per-machine spec table, never observed for this run
+# -----------------------------------------------------------------------------
+system:
+  user_cares: "How was the run laid out across the machine? (Sets the scale that every I/O number must be read against.)"
+  groups:
+
+    # Only system_name is worked out from the run's own environment. The other
+    # four are machine specs looked up from the same table `rated_peak_performance`
+    # uses -- source: config, not derived.
+    hardware_specs:
+      system_name:       { type: string, unit: text, source: derived, desc: "Machine/cluster name." }
+      cpu_model:         { type: string, unit: text, source: config, desc: "CPU model per node." }
+      cores_per_node:    { type: int,    unit: count, source: config, desc: "Physical cores per node (for ranks/node vs cores sanity checks)." }
+      memory_per_node:   { type: int,    unit: bytes, source: config, desc: "RAM per node." }
+      interconnect:      { type: string, unit: text, source: config, desc: "Network fabric (Slingshot, InfiniBand, Aries)." }
+
+    scheduler:
+      scheduler:         { type: enum,   unit: "slurm|pbs|lsf|cobalt|flux|none|other", source: derived, desc: "Batch scheduler." }
+      queue:             { type: string, unit: text, source: derived, desc: "Queue/partition the job ran in." }
+      allocation:        { type: string, unit: text, source: derived, desc: "Project/allocation/account charged." }
+      hostlist:          { type: list,   unit: text, source: derived, desc: "Node hostnames (also recoverable from DXT hostname field)." }
+
+    # -------------------------------------------------------------------------
+    # RATED PEAK PERFORMANCE -- the storage/network PERFORMANCE ENVELOPE. These
+    # are NOT measured by Darshan and NOT achieved by this run; they are the
+    # rated reference numbers you compare achieved I/O against to answer "is this
+    # throughput good?". Sourced from a per-system config/spec table (vendor spec
+    # sheets, IOR/mdtest acceptance runs, site docs). Without these, achieved
+    # bandwidth is a number with no yardstick.
+    # source: config -> looked up from a system spec table keyed by system_name.
+    # -------------------------------------------------------------------------
+    rated_peak_performance:
+      peak_read_bw:            { type: float, unit: GiB/s,   source: config, desc: "Peak aggregate READ bandwidth of the target filesystem (full-system)." }
+      peak_write_bw:           { type: float, unit: GiB/s,   source: config, desc: "Peak aggregate WRITE bandwidth of the target filesystem (full-system)." }
+      per_ost_bw:              { type: float, unit: GiB/s,   source: config, desc: "Sustained bandwidth of a single OST/storage target; ceiling for a 1-stripe file." }
+      per_node_bw:             { type: float, unit: GiB/s,   source: config, desc: "Max I/O bandwidth one compute node can drive to the FS (NIC/injection limit)." }
+      measured_ior_bw:         { type: float, unit: GiB/s,   source: config, desc: "Realistic achievable bandwidth from a tuned IOR benchmark (better yardstick than vendor peak)." }
+      peak_metadata_rate:      { type: float, unit: ops/s,   source: config, desc: "Peak metadata ops/s (creates/stats) from mdtest; ceiling for open/stat-heavy jobs." }
+      total_osts:              { type: int,   unit: count,   source: config, desc: "OSTs/storage targets in the filesystem (also seen per-file as LUSTRE_OSTS)." }
+      recommended_stripe_size: { type: int,   unit: bytes,   source: config, desc: "Site-recommended Lustre stripe size (baseline for alignment checks)." }
+      network_injection_bw:    { type: float, unit: GiB/s,   source: config, desc: "Per-node network injection bandwidth (fabric ceiling)." }
+
+# -----------------------------------------------------------------------------
+# MODULES -- one category per I/O interface. Same sub-grouping across modules
+# so an agent can ask the same question ("volume?", "timing?") of any interface.
+# Grain of every counter: (file record x rank).
+# -----------------------------------------------------------------------------
+modules:
+
+  # ===========================================================================
+  POSIX_IO:
+    user_cares: "The ground truth of bytes hitting the filesystem, and whether the access pattern is filesystem-friendly."
+    layer: "Byte-level POSIX calls (open/read/write/seek/stat/fsync)."
+    groups:
+
+      volume:
+        POSIX_BYTES_READ:       { type: int, unit: bytes,        desc: "Total bytes read." }
+        POSIX_BYTES_WRITTEN:    { type: int, unit: bytes,        desc: "Total bytes written." }
+        POSIX_MAX_BYTE_READ:    { type: int, unit: bytes_offset, desc: "Highest file offset read." }
+        POSIX_MAX_BYTE_WRITTEN: { type: int, unit: bytes_offset, desc: "Highest file offset written." }
+
+      operations:
+        POSIX_OPENS:    { type: int, unit: count, desc: "open() calls -- BUT this counter also includes POSIX_FILENOS and POSIX_DUPS. For distinct open() calls use insights.behavior.distinct_opens; never add FILENOS to it. See conventions.counter_overlaps." }
+        POSIX_READS:    { type: int, unit: count, desc: "read() calls." }
+        POSIX_WRITES:   { type: int, unit: count, desc: "write() calls." }
+        POSIX_SEEKS:    { type: int, unit: count, desc: "seek() calls." }
+        POSIX_STATS:    { type: int, unit: count, desc: "stat() calls." }
+        POSIX_MMAPS:    { type: int, unit: count, desc: "mmap() calls." }
+        POSIX_FSYNCS:   { type: int, unit: count, desc: "fsync() calls." }
+        POSIX_FDSYNCS:  { type: int, unit: count, desc: "fdatasync() calls." }
+        POSIX_DUPS:     { type: int, unit: count, desc: "dup()/dup2() calls. Already counted inside POSIX_OPENS." }
+        POSIX_FILENOS:  { type: int, unit: count, desc: "fileno() calls. Already counted inside POSIX_OPENS." }
+        POSIX_RENAME_SOURCES: { type: int, unit: count, desc: "Times this record was a rename source." }
+        POSIX_RENAME_TARGETS: { type: int, unit: count, desc: "Times this record was a rename target." }
+        POSIX_RENAMED_FROM:   { type: int, unit: count, desc: "Record ID this file was renamed from." }
+        POSIX_MODE:             { type: int, unit: bitmask, desc: "File mode bits as recorded at open." }
+        POSIX_MAX_READ_TIME_SIZE:  { type: int, unit: bytes, desc: "Size of the single slowest read. A size, not a duration -- pair it with POSIX_F_MAX_READ_TIME." }
+        POSIX_MAX_WRITE_TIME_SIZE: { type: int, unit: bytes, desc: "Size of the single slowest write. A size, not a duration -- pair it with POSIX_F_MAX_WRITE_TIME." }
+
+      access_pattern:
+        POSIX_CONSEC_READS:    { type: int, unit: count, desc: "Reads starting where the previous ended." }
+        POSIX_CONSEC_WRITES:   { type: int, unit: count, desc: "Writes starting where the previous ended." }
+        POSIX_SEQ_READS:       { type: int, unit: count, desc: "Reads at a higher offset than the previous (sequential)." }
+        POSIX_SEQ_WRITES:      { type: int, unit: count, desc: "Writes at a higher offset than the previous (sequential)." }
+        POSIX_RW_SWITCHES:     { type: int, unit: count, desc: "Read<->write direction switches." }
+
+      # Boundaries and fault counts, kept apart from access_pattern on purpose:
+      # see conventions.alignment_counters.
+      alignment:
+        POSIX_MEM_NOT_ALIGNED:  { type: int, unit: count, desc: "NUMBER OF ACCESSES not aligned in memory. This is the fault count; 0 means nothing was misaligned." }
+        POSIX_FILE_NOT_ALIGNED: { type: int, unit: count, desc: "NUMBER OF ACCESSES not aligned in file. This is the fault count; 0 means nothing was misaligned." }
+        POSIX_MEM_ALIGNMENT:    { type: int, unit: bytes, desc: "Configured memory alignment BOUNDARY in bytes (a setting, not a fault). Judge it against POSIX_MEM_NOT_ALIGNED, never on its own." }
+        POSIX_FILE_ALIGNMENT:   { type: int, unit: bytes, desc: "Configured file alignment BOUNDARY in bytes (a setting, not a fault). Judge it against POSIX_FILE_NOT_ALIGNED, never on its own." }
+
+      access_sizes:
+        POSIX_SIZE_READ_0_100:     { type: int, unit: count, desc: "Reads of size 0-100 bytes." }
+        POSIX_SIZE_READ_100_1K:    { type: int, unit: count, desc: "Reads of size 100 B - 1 KiB." }
+        POSIX_SIZE_READ_1K_10K:    { type: int, unit: count, desc: "Reads of size 1 KiB - 10 KiB." }
+        POSIX_SIZE_READ_10K_100K:  { type: int, unit: count, desc: "Reads of size 10 KiB - 100 KiB." }
+        POSIX_SIZE_READ_100K_1M:   { type: int, unit: count, desc: "Reads of size 100 KiB - 1 MiB." }
+        POSIX_SIZE_READ_1M_4M:     { type: int, unit: count, desc: "Reads of size 1 MiB - 4 MiB." }
+        POSIX_SIZE_READ_4M_10M:    { type: int, unit: count, desc: "Reads of size 4 MiB - 10 MiB." }
+        POSIX_SIZE_READ_10M_100M:  { type: int, unit: count, desc: "Reads of size 10 MiB - 100 MiB." }
+        POSIX_SIZE_READ_100M_1G:   { type: int, unit: count, desc: "Reads of size 100 MiB - 1 GiB." }
+        POSIX_SIZE_READ_1G_PLUS:   { type: int, unit: count, desc: "Reads of size >= 1 GiB." }
+        POSIX_SIZE_WRITE_0_100:    { type: int, unit: count, desc: "Writes of size 0-100 bytes." }
+        POSIX_SIZE_WRITE_100_1K:   { type: int, unit: count, desc: "Writes of size 100 B - 1 KiB." }
+        POSIX_SIZE_WRITE_1K_10K:   { type: int, unit: count, desc: "Writes of size 1 KiB - 10 KiB." }
+        POSIX_SIZE_WRITE_10K_100K: { type: int, unit: count, desc: "Writes of size 10 KiB - 100 KiB." }
+        POSIX_SIZE_WRITE_100K_1M:  { type: int, unit: count, desc: "Writes of size 100 KiB - 1 MiB." }
+        POSIX_SIZE_WRITE_1M_4M:    { type: int, unit: count, desc: "Writes of size 1 MiB - 4 MiB." }
+        POSIX_SIZE_WRITE_4M_10M:   { type: int, unit: count, desc: "Writes of size 4 MiB - 10 MiB." }
+        POSIX_SIZE_WRITE_10M_100M: { type: int, unit: count, desc: "Writes of size 10 MiB - 100 MiB." }
+        POSIX_SIZE_WRITE_100M_1G:  { type: int, unit: count, desc: "Writes of size 100 MiB - 1 GiB." }
+        POSIX_SIZE_WRITE_1G_PLUS:  { type: int, unit: count, desc: "Writes of size >= 1 GiB." }
+        POSIX_ACCESS1_ACCESS: { type: int, unit: bytes, desc: "1st most common access size." }
+        POSIX_ACCESS2_ACCESS: { type: int, unit: bytes, desc: "2nd most common access size." }
+        POSIX_ACCESS3_ACCESS: { type: int, unit: bytes, desc: "3rd most common access size." }
+        POSIX_ACCESS4_ACCESS: { type: int, unit: bytes, desc: "4th most common access size." }
+        POSIX_ACCESS1_COUNT:  { type: int, unit: count, desc: "Occurrences of the 1st most common access size." }
+        POSIX_ACCESS2_COUNT:  { type: int, unit: count, desc: "Occurrences of the 2nd most common access size." }
+        POSIX_ACCESS3_COUNT:  { type: int, unit: count, desc: "Occurrences of the 3rd most common access size." }
+        POSIX_ACCESS4_COUNT:  { type: int, unit: count, desc: "Occurrences of the 4th most common access size." }
+        POSIX_STRIDE1_STRIDE: { type: int, unit: bytes, desc: "1st most common stride." }
+        POSIX_STRIDE2_STRIDE: { type: int, unit: bytes, desc: "2nd most common stride." }
+        POSIX_STRIDE3_STRIDE: { type: int, unit: bytes, desc: "3rd most common stride." }
+        POSIX_STRIDE4_STRIDE: { type: int, unit: bytes, desc: "4th most common stride." }
+        POSIX_STRIDE1_COUNT:  { type: int, unit: count, desc: "Occurrences of the 1st most common stride." }
+        POSIX_STRIDE2_COUNT:  { type: int, unit: count, desc: "Occurrences of the 2nd most common stride." }
+        POSIX_STRIDE3_COUNT:  { type: int, unit: count, desc: "Occurrences of the 3rd most common stride." }
+        POSIX_STRIDE4_COUNT:  { type: int, unit: count, desc: "Occurrences of the 4th most common stride." }
+
+      timing:
+        POSIX_F_READ_TIME:       { type: float, unit: seconds, desc: "Cumulative time in reads." }
+        POSIX_F_WRITE_TIME:      { type: float, unit: seconds, desc: "Cumulative time in writes." }
+        POSIX_F_META_TIME:       { type: float, unit: seconds, desc: "Cumulative time in metadata ops (open/stat/seek/...)." }
+        POSIX_F_MAX_READ_TIME:   { type: float, unit: seconds, desc: "Slowest single read." }
+        POSIX_F_MAX_WRITE_TIME:  { type: float, unit: seconds, desc: "Slowest single write." }
+        POSIX_F_OPEN_START_TIMESTAMP:  { type: float, unit: seconds, desc: "First open time (from job start)." }
+        POSIX_F_READ_START_TIMESTAMP:  { type: float, unit: seconds, desc: "First read time (from job start)." }
+        POSIX_F_WRITE_START_TIMESTAMP: { type: float, unit: seconds, desc: "First write time (from job start)." }
+        POSIX_F_CLOSE_START_TIMESTAMP: { type: float, unit: seconds, desc: "First close time (from job start)." }
+        POSIX_F_OPEN_END_TIMESTAMP:    { type: float, unit: seconds, desc: "Last open time (from job start)." }
+        POSIX_F_READ_END_TIMESTAMP:    { type: float, unit: seconds, desc: "Last read time (from job start)." }
+        POSIX_F_WRITE_END_TIMESTAMP:   { type: float, unit: seconds, desc: "Last write time (from job start)." }
+        POSIX_F_CLOSE_END_TIMESTAMP:   { type: float, unit: seconds, desc: "Last close time (from job start)." }
+        POSIX_F_FASTEST_RANK_TIME:  { type: float, unit: seconds, desc: "I/O time of the fastest rank on shared files. Re-derived by libdarshan-util from per-rank state; -1 when a --total-style reduction cannot recover it." }
+        POSIX_F_SLOWEST_RANK_TIME:  { type: float, unit: seconds, desc: "I/O time of the slowest rank on shared files. Same sentinel convention as the fastest-rank counter." }
+        POSIX_F_VARIANCE_RANK_TIME: { type: float, unit: seconds2, desc: "Variance of per-rank I/O time on shared files. 0 means no spread OR a single contributing rank -- read it with the fastest/slowest pair." }
+
+      rank_balance:
+        POSIX_FASTEST_RANK:          { type: int,   unit: id,      desc: "Rank with least I/O time (shared files)." }
+        POSIX_SLOWEST_RANK:          { type: int,   unit: id,      desc: "Rank with most I/O time (shared files)." }
+        POSIX_FASTEST_RANK_BYTES:    { type: int,   unit: bytes,   desc: "Bytes moved by the fastest rank." }
+        POSIX_SLOWEST_RANK_BYTES:    { type: int,   unit: bytes,   desc: "Bytes moved by the slowest rank." }
+        POSIX_F_VARIANCE_RANK_TIME:  { type: float, unit: seconds, desc: "Variance of per-rank I/O time." }
+        POSIX_F_VARIANCE_RANK_BYTES: { type: float, unit: bytes,   desc: "Variance of per-rank bytes." }
+
+  # ===========================================================================
+  STDIO:
+    user_cares: "Buffered library I/O -- often small, and often accidental (logging, text output)."
+    layer: "C stdio (fopen/fread/fwrite/fprintf/fflush)."
+    groups:
+      volume:
+        STDIO_BYTES_READ:       { type: int, unit: bytes,        desc: "Total bytes read." }
+        STDIO_BYTES_WRITTEN:    { type: int, unit: bytes,        desc: "Total bytes written." }
+        STDIO_MAX_BYTE_READ:    { type: int, unit: bytes_offset, desc: "Highest offset read." }
+        STDIO_MAX_BYTE_WRITTEN: { type: int, unit: bytes_offset, desc: "Highest offset written." }
+      operations:
+        STDIO_OPENS:    { type: int, unit: count, desc: "fopen() calls." }
+        STDIO_FDOPENS:  { type: int, unit: count, desc: "fdopen() calls." }
+        STDIO_READS:    { type: int, unit: count, desc: "fread() calls." }
+        STDIO_WRITES:   { type: int, unit: count, desc: "fwrite() calls." }
+        STDIO_SEEKS:    { type: int, unit: count, desc: "fseek() calls." }
+        STDIO_FLUSHES:  { type: int, unit: count, desc: "fflush() calls." }
+      timing:
+        STDIO_F_READ_TIME:  { type: float, unit: seconds, desc: "Cumulative time in reads." }
+        STDIO_F_WRITE_TIME: { type: float, unit: seconds, desc: "Cumulative time in writes." }
+        STDIO_F_META_TIME:  { type: float, unit: seconds, desc: "Cumulative time in metadata ops." }
+        STDIO_F_OPEN_START_TIMESTAMP:  { type: float, unit: seconds, desc: "First open time (from job start)." }
+        STDIO_F_READ_START_TIMESTAMP:  { type: float, unit: seconds, desc: "First read time (from job start)." }
+        STDIO_F_WRITE_START_TIMESTAMP: { type: float, unit: seconds, desc: "First write time (from job start)." }
+        STDIO_F_CLOSE_START_TIMESTAMP: { type: float, unit: seconds, desc: "First close time (from job start)." }
+        STDIO_F_OPEN_END_TIMESTAMP:    { type: float, unit: seconds, desc: "Last open time (from job start)." }
+        STDIO_F_READ_END_TIMESTAMP:    { type: float, unit: seconds, desc: "Last read time (from job start)." }
+        STDIO_F_WRITE_END_TIMESTAMP:   { type: float, unit: seconds, desc: "Last write time (from job start)." }
+        STDIO_F_CLOSE_END_TIMESTAMP:   { type: float, unit: seconds, desc: "Last close time (from job start)." }
+        STDIO_F_FASTEST_RANK_TIME:  { type: float, unit: seconds, desc: "I/O time of the fastest rank on shared files. Re-derived by libdarshan-util from per-rank state; -1 when a --total-style reduction cannot recover it." }
+        STDIO_F_SLOWEST_RANK_TIME:  { type: float, unit: seconds, desc: "I/O time of the slowest rank on shared files. Same sentinel convention as the fastest-rank counter." }
+        STDIO_F_VARIANCE_RANK_TIME: { type: float, unit: seconds2, desc: "Variance of per-rank I/O time on shared files. 0 means no spread OR a single contributing rank -- read it with the fastest/slowest pair." }
+      rank_balance:
+        STDIO_FASTEST_RANK:          { type: int,   unit: id,      desc: "Rank with least I/O time." }
+        STDIO_SLOWEST_RANK:          { type: int,   unit: id,      desc: "Rank with most I/O time." }
+        STDIO_F_VARIANCE_RANK_TIME:  { type: float, unit: seconds, desc: "Variance of per-rank I/O time." }
+        STDIO_F_VARIANCE_RANK_BYTES: { type: float, unit: bytes,   desc: "Variance of per-rank bytes." }
+        STDIO_FASTEST_RANK_BYTES:   { type: int, unit: bytes, desc: "Bytes moved by the fastest rank on shared files. -1 when not derivable from this reduction; 0 is a real zero and is evidence of imbalance." }
+        STDIO_SLOWEST_RANK_BYTES:   { type: int, unit: bytes, desc: "Bytes moved by the slowest rank on shared files. Same conventions as the fastest-rank counter." }
+
+  # ===========================================================================
+  MPIIO:
+    user_cares: "Whether the app uses collective I/O (good) or independent I/O (often bad at scale)."
+    layer: "MPI-IO calls (independent/collective, blocking/nonblocking)."
+    groups:
+      volume:
+        MPIIO_BYTES_READ:    { type: int, unit: bytes, desc: "Total bytes read." }
+        MPIIO_BYTES_WRITTEN: { type: int, unit: bytes, desc: "Total bytes written." }
+      access_pattern:
+        MPIIO_RW_SWITCHES:         { type: int, unit: count, desc: "Read<->write direction switches at the MPI-IO layer." }
+
+      operations:
+        MPIIO_INDEP_OPENS:  { type: int, unit: count, desc: "Independent opens." }
+        MPIIO_COLL_OPENS:   { type: int, unit: count, desc: "Collective opens." }
+        MPIIO_INDEP_READS:  { type: int, unit: count, desc: "Independent reads." }
+        MPIIO_INDEP_WRITES: { type: int, unit: count, desc: "Independent writes." }
+        MPIIO_COLL_READS:   { type: int, unit: count, desc: "Collective reads." }
+        MPIIO_COLL_WRITES:  { type: int, unit: count, desc: "Collective writes." }
+        MPIIO_NB_READS:     { type: int, unit: count, desc: "Nonblocking reads." }
+        MPIIO_NB_WRITES:    { type: int, unit: count, desc: "Nonblocking writes." }
+        MPIIO_SPLIT_READS:  { type: int, unit: count, desc: "Split-collective reads." }
+        MPIIO_SPLIT_WRITES: { type: int, unit: count, desc: "Split-collective writes." }
+        MPIIO_SYNCS:        { type: int, unit: count, desc: "Sync calls." }
+        MPIIO_VIEWS:        { type: int, unit: count, desc: "set_view calls." }
+        MPIIO_HINTS:        { type: int, unit: count, desc: "MPI-IO hints set." }
+        MPIIO_MODE:                { type: int, unit: bitmask, desc: "MPI-IO file mode / amode bits as recorded at open." }
+        MPIIO_MAX_READ_TIME_SIZE:  { type: int, unit: bytes, desc: "Size of the single slowest MPI-IO read. A size, not a duration." }
+        MPIIO_MAX_WRITE_TIME_SIZE: { type: int, unit: bytes, desc: "Size of the single slowest MPI-IO write. A size, not a duration." }
+      access_sizes:
+        MPIIO_SIZE_READ_AGG_0_100:     { type: int, unit: count, desc: "Aggregate reads of size 0-100 bytes." }
+        MPIIO_SIZE_READ_AGG_100_1K:    { type: int, unit: count, desc: "Aggregate reads of size 100 B - 1 KiB." }
+        MPIIO_SIZE_READ_AGG_1K_10K:    { type: int, unit: count, desc: "Aggregate reads of size 1 KiB - 10 KiB." }
+        MPIIO_SIZE_READ_AGG_10K_100K:  { type: int, unit: count, desc: "Aggregate reads of size 10 KiB - 100 KiB." }
+        MPIIO_SIZE_READ_AGG_100K_1M:   { type: int, unit: count, desc: "Aggregate reads of size 100 KiB - 1 MiB." }
+        MPIIO_SIZE_READ_AGG_1M_4M:     { type: int, unit: count, desc: "Aggregate reads of size 1 MiB - 4 MiB." }
+        MPIIO_SIZE_READ_AGG_4M_10M:    { type: int, unit: count, desc: "Aggregate reads of size 4 MiB - 10 MiB." }
+        MPIIO_SIZE_READ_AGG_10M_100M:  { type: int, unit: count, desc: "Aggregate reads of size 10 MiB - 100 MiB." }
+        MPIIO_SIZE_READ_AGG_100M_1G:   { type: int, unit: count, desc: "Aggregate reads of size 100 MiB - 1 GiB." }
+        MPIIO_SIZE_READ_AGG_1G_PLUS:   { type: int, unit: count, desc: "Aggregate reads of size >= 1 GiB." }
+        MPIIO_SIZE_WRITE_AGG_0_100:    { type: int, unit: count, desc: "Aggregate writes of size 0-100 bytes." }
+        MPIIO_SIZE_WRITE_AGG_100_1K:   { type: int, unit: count, desc: "Aggregate writes of size 100 B - 1 KiB." }
+        MPIIO_SIZE_WRITE_AGG_1K_10K:   { type: int, unit: count, desc: "Aggregate writes of size 1 KiB - 10 KiB." }
+        MPIIO_SIZE_WRITE_AGG_10K_100K: { type: int, unit: count, desc: "Aggregate writes of size 10 KiB - 100 KiB." }
+        MPIIO_SIZE_WRITE_AGG_100K_1M:  { type: int, unit: count, desc: "Aggregate writes of size 100 KiB - 1 MiB." }
+        MPIIO_SIZE_WRITE_AGG_1M_4M:    { type: int, unit: count, desc: "Aggregate writes of size 1 MiB - 4 MiB." }
+        MPIIO_SIZE_WRITE_AGG_4M_10M:   { type: int, unit: count, desc: "Aggregate writes of size 4 MiB - 10 MiB." }
+        MPIIO_SIZE_WRITE_AGG_10M_100M: { type: int, unit: count, desc: "Aggregate writes of size 10 MiB - 100 MiB." }
+        MPIIO_SIZE_WRITE_AGG_100M_1G:  { type: int, unit: count, desc: "Aggregate writes of size 100 MiB - 1 GiB." }
+        MPIIO_SIZE_WRITE_AGG_1G_PLUS:  { type: int, unit: count, desc: "Aggregate writes of size >= 1 GiB." }
+        MPIIO_ACCESS1_ACCESS: { type: int, unit: bytes, desc: "1st most common access size." }
+        MPIIO_ACCESS2_ACCESS: { type: int, unit: bytes, desc: "2nd most common access size." }
+        MPIIO_ACCESS3_ACCESS: { type: int, unit: bytes, desc: "3rd most common access size." }
+        MPIIO_ACCESS4_ACCESS: { type: int, unit: bytes, desc: "4th most common access size." }
+        MPIIO_ACCESS1_COUNT:  { type: int, unit: count, desc: "Occurrences of the 1st most common access size." }
+        MPIIO_ACCESS2_COUNT:  { type: int, unit: count, desc: "Occurrences of the 2nd most common access size." }
+        MPIIO_ACCESS3_COUNT:  { type: int, unit: count, desc: "Occurrences of the 3rd most common access size." }
+        MPIIO_ACCESS4_COUNT:  { type: int, unit: count, desc: "Occurrences of the 4th most common access size." }
+      timing:
+        MPIIO_F_READ_TIME:  { type: float, unit: seconds, desc: "Cumulative time in reads." }
+        MPIIO_F_WRITE_TIME: { type: float, unit: seconds, desc: "Cumulative time in writes." }
+        MPIIO_F_META_TIME:  { type: float, unit: seconds, desc: "Cumulative time in metadata ops." }
+        MPIIO_F_MAX_READ_TIME:  { type: float, unit: seconds, desc: "Slowest single read." }
+        MPIIO_F_MAX_WRITE_TIME: { type: float, unit: seconds, desc: "Slowest single write." }
+        MPIIO_F_OPEN_START_TIMESTAMP:  { type: float, unit: seconds, desc: "First open time (from job start)." }
+        MPIIO_F_READ_START_TIMESTAMP:  { type: float, unit: seconds, desc: "First read time (from job start)." }
+        MPIIO_F_WRITE_START_TIMESTAMP: { type: float, unit: seconds, desc: "First write time (from job start)." }
+        MPIIO_F_CLOSE_START_TIMESTAMP: { type: float, unit: seconds, desc: "First close time (from job start)." }
+        MPIIO_F_OPEN_END_TIMESTAMP:    { type: float, unit: seconds, desc: "Last open time (from job start)." }
+        MPIIO_F_READ_END_TIMESTAMP:    { type: float, unit: seconds, desc: "Last read time (from job start)." }
+        MPIIO_F_WRITE_END_TIMESTAMP:   { type: float, unit: seconds, desc: "Last write time (from job start)." }
+        MPIIO_F_CLOSE_END_TIMESTAMP:   { type: float, unit: seconds, desc: "Last close time (from job start)." }
+        MPIIO_F_FASTEST_RANK_TIME:  { type: float, unit: seconds, desc: "I/O time of the fastest rank on shared files. Re-derived by libdarshan-util from per-rank state; -1 when a --total-style reduction cannot recover it." }
+        MPIIO_F_SLOWEST_RANK_TIME:  { type: float, unit: seconds, desc: "I/O time of the slowest rank on shared files. Same sentinel convention as the fastest-rank counter." }
+        MPIIO_F_VARIANCE_RANK_TIME: { type: float, unit: seconds2, desc: "Variance of per-rank I/O time on shared files. 0 means no spread OR a single contributing rank -- read it with the fastest/slowest pair." }
+      rank_balance:
+        MPIIO_FASTEST_RANK:          { type: int,   unit: id,      desc: "Rank with least I/O time." }
+        MPIIO_SLOWEST_RANK:          { type: int,   unit: id,      desc: "Rank with most I/O time." }
+        MPIIO_F_VARIANCE_RANK_TIME:  { type: float, unit: seconds, desc: "Variance of per-rank I/O time." }
+        MPIIO_F_VARIANCE_RANK_BYTES: { type: float, unit: bytes,   desc: "Variance of per-rank bytes." }
+        MPIIO_FASTEST_RANK_BYTES:   { type: int, unit: bytes, desc: "Bytes moved by the fastest rank on shared files. -1 when not derivable from this reduction; 0 is a real zero and is evidence of imbalance." }
+        MPIIO_SLOWEST_RANK_BYTES:   { type: int, unit: bytes, desc: "Bytes moved by the slowest rank on shared files. Same conventions as the fastest-rank counter." }
+
+  # ===========================================================================
+  HDF5:
+    user_cares: "High-level scientific data access: dataset shapes, hyperslab efficiency, chunking, and whether it rides MPI-IO collectively."
+    layer: "HDF5 library. Split into H5F (file) and H5D (dataset) sub-modules."
+    groups:
+      file_H5F:
+        H5F_OPENS:       { type: int,   unit: count,   desc: "HDF5 file opens." }
+        H5F_FLUSHES:     { type: int,   unit: count,   desc: "HDF5 file flushes." }
+        H5F_USE_MPIIO:   { type: int,   unit: flag,    desc: "File opened with the MPI-IO driver." }
+        H5F_F_META_TIME: { type: float, unit: seconds, desc: "Cumulative HDF5 file metadata time." }
+      dataset_H5D:
+        H5D_OPENS:                    { type: int, unit: count, desc: "Dataset opens." }
+        H5D_READS:                    { type: int, unit: count, desc: "Dataset reads." }
+        H5D_WRITES:                   { type: int, unit: count, desc: "Dataset writes." }
+        H5D_FLUSHES:                  { type: int, unit: count, desc: "Dataset flushes." }
+        H5D_BYTES_READ:               { type: int, unit: bytes, desc: "Bytes read." }
+        H5D_BYTES_WRITTEN:            { type: int, unit: bytes, desc: "Bytes written." }
+        H5D_REGULAR_HYPERSLAB_SELECTS:   { type: int, unit: count, desc: "Regular hyperslab selections (efficient)." }
+        H5D_IRREGULAR_HYPERSLAB_SELECTS: { type: int, unit: count, desc: "Irregular hyperslab selections (costly)." }
+        H5D_POINT_SELECTS:            { type: int, unit: count, desc: "Point selections." }
+        H5D_SIZE_READ_AGG_0_100:      { type: int, unit: count, desc: "Aggregate reads of size 0-100 bytes." }
+        H5D_SIZE_READ_AGG_100_1K:     { type: int, unit: count, desc: "Aggregate reads of size 100 B - 1 KiB." }
+        H5D_SIZE_READ_AGG_1K_10K:     { type: int, unit: count, desc: "Aggregate reads of size 1 KiB - 10 KiB." }
+        H5D_SIZE_READ_AGG_10K_100K:   { type: int, unit: count, desc: "Aggregate reads of size 10 KiB - 100 KiB." }
+        H5D_SIZE_READ_AGG_100K_1M:    { type: int, unit: count, desc: "Aggregate reads of size 100 KiB - 1 MiB." }
+        H5D_SIZE_READ_AGG_1M_4M:      { type: int, unit: count, desc: "Aggregate reads of size 1 MiB - 4 MiB." }
+        H5D_SIZE_READ_AGG_4M_10M:     { type: int, unit: count, desc: "Aggregate reads of size 4 MiB - 10 MiB." }
+        H5D_SIZE_READ_AGG_10M_100M:   { type: int, unit: count, desc: "Aggregate reads of size 10 MiB - 100 MiB." }
+        H5D_SIZE_READ_AGG_100M_1G:    { type: int, unit: count, desc: "Aggregate reads of size 100 MiB - 1 GiB." }
+        H5D_SIZE_READ_AGG_1G_PLUS:    { type: int, unit: count, desc: "Aggregate reads of size >= 1 GiB." }
+        H5D_SIZE_WRITE_AGG_0_100:     { type: int, unit: count, desc: "Aggregate writes of size 0-100 bytes." }
+        H5D_SIZE_WRITE_AGG_100_1K:    { type: int, unit: count, desc: "Aggregate writes of size 100 B - 1 KiB." }
+        H5D_SIZE_WRITE_AGG_1K_10K:    { type: int, unit: count, desc: "Aggregate writes of size 1 KiB - 10 KiB." }
+        H5D_SIZE_WRITE_AGG_10K_100K:  { type: int, unit: count, desc: "Aggregate writes of size 10 KiB - 100 KiB." }
+        H5D_SIZE_WRITE_AGG_100K_1M:   { type: int, unit: count, desc: "Aggregate writes of size 100 KiB - 1 MiB." }
+        H5D_SIZE_WRITE_AGG_1M_4M:     { type: int, unit: count, desc: "Aggregate writes of size 1 MiB - 4 MiB." }
+        H5D_SIZE_WRITE_AGG_4M_10M:    { type: int, unit: count, desc: "Aggregate writes of size 4 MiB - 10 MiB." }
+        H5D_SIZE_WRITE_AGG_10M_100M:  { type: int, unit: count, desc: "Aggregate writes of size 10 MiB - 100 MiB." }
+        H5D_SIZE_WRITE_AGG_100M_1G:   { type: int, unit: count, desc: "Aggregate writes of size 100 MiB - 1 GiB." }
+        H5D_SIZE_WRITE_AGG_1G_PLUS:   { type: int, unit: count, desc: "Aggregate writes of size >= 1 GiB." }
+        H5D_DATASPACE_NDIMS:          { type: int, unit: count, desc: "Dataspace dimensionality." }
+        H5D_DATASPACE_NPOINTS:        { type: int, unit: count, desc: "Dataspace element count." }
+        H5D_CHUNK_SIZE_D1:            { type: int, unit: bytes, desc: "Chunk extent, dimension 1." }
+        H5D_CHUNK_SIZE_D2:            { type: int, unit: bytes, desc: "Chunk extent, dimension 2." }
+        H5D_CHUNK_SIZE_D3:            { type: int, unit: bytes, desc: "Chunk extent, dimension 3." }
+        H5D_CHUNK_SIZE_D4:            { type: int, unit: bytes, desc: "Chunk extent, dimension 4." }
+        H5D_CHUNK_SIZE_D5:            { type: int, unit: bytes, desc: "Chunk extent, dimension 5." }
+        H5D_USE_MPIIO_COLLECTIVE:     { type: int, unit: flag,  desc: "Dataset I/O used MPI-IO collective mode." }
+        H5D_F_READ_TIME:              { type: float, unit: seconds, desc: "Cumulative dataset read time." }
+        H5D_F_WRITE_TIME:             { type: float, unit: seconds, desc: "Cumulative dataset write time." }
+        H5D_F_META_TIME:              { type: float, unit: seconds, desc: "Cumulative dataset metadata time." }
+
+  # ===========================================================================
+  PNETCDF:
+    user_cares: "Parallel NetCDF access at file and per-variable granularity, and collective vs independent use."
+    layer: "PnetCDF library. Split into PNETCDF_FILE and PNETCDF_VAR sub-modules."
+    groups:
+      file:
+        PNETCDF_FILE_OPENS:       { type: int, unit: count, desc: "File opens." }
+        PNETCDF_FILE_INDEP_OPENS: { type: int, unit: count, desc: "Independent opens." }
+        PNETCDF_FILE_COLL_OPENS:  { type: int, unit: count, desc: "Collective opens." }
+        PNETCDF_FILE_REDEFS:      { type: int, unit: count, desc: "Redefine-mode entries." }
+        PNETCDF_FILE_WAITS:       { type: int, unit: count, desc: "Nonblocking waits." }
+        PNETCDF_FILE_F_META_TIME: { type: float, unit: seconds, desc: "Cumulative file metadata time." }
+      variable:
+        PNETCDF_VAR_OPENS:        { type: int, unit: count, desc: "Variable opens/defs." }
+        PNETCDF_VAR_INDEP_READS:  { type: int, unit: count, desc: "Independent reads." }
+        PNETCDF_VAR_INDEP_WRITES: { type: int, unit: count, desc: "Independent writes." }
+        PNETCDF_VAR_COLL_READS:   { type: int, unit: count, desc: "Collective reads." }
+        PNETCDF_VAR_COLL_WRITES:  { type: int, unit: count, desc: "Collective writes." }
+        PNETCDF_VAR_NB_READS:     { type: int, unit: count, desc: "Nonblocking reads." }
+        PNETCDF_VAR_NB_WRITES:    { type: int, unit: count, desc: "Nonblocking writes." }
+        PNETCDF_VAR_BYTES_READ:   { type: int, unit: bytes, desc: "Bytes read." }
+        PNETCDF_VAR_BYTES_WRITTEN: { type: int, unit: bytes, desc: "Bytes written." }
+        PNETCDF_VAR_SIZE_READ_AGG_0_100:     { type: int, unit: count, desc: "Aggregate reads of size 0-100 bytes." }
+        PNETCDF_VAR_SIZE_READ_AGG_100_1K:    { type: int, unit: count, desc: "Aggregate reads of size 100 B - 1 KiB." }
+        PNETCDF_VAR_SIZE_READ_AGG_1K_10K:    { type: int, unit: count, desc: "Aggregate reads of size 1 KiB - 10 KiB." }
+        PNETCDF_VAR_SIZE_READ_AGG_10K_100K:  { type: int, unit: count, desc: "Aggregate reads of size 10 KiB - 100 KiB." }
+        PNETCDF_VAR_SIZE_READ_AGG_100K_1M:   { type: int, unit: count, desc: "Aggregate reads of size 100 KiB - 1 MiB." }
+        PNETCDF_VAR_SIZE_READ_AGG_1M_4M:     { type: int, unit: count, desc: "Aggregate reads of size 1 MiB - 4 MiB." }
+        PNETCDF_VAR_SIZE_READ_AGG_4M_10M:    { type: int, unit: count, desc: "Aggregate reads of size 4 MiB - 10 MiB." }
+        PNETCDF_VAR_SIZE_READ_AGG_10M_100M:  { type: int, unit: count, desc: "Aggregate reads of size 10 MiB - 100 MiB." }
+        PNETCDF_VAR_SIZE_READ_AGG_100M_1G:   { type: int, unit: count, desc: "Aggregate reads of size 100 MiB - 1 GiB." }
+        PNETCDF_VAR_SIZE_READ_AGG_1G_PLUS:   { type: int, unit: count, desc: "Aggregate reads of size >= 1 GiB." }
+        PNETCDF_VAR_SIZE_WRITE_AGG_0_100:    { type: int, unit: count, desc: "Aggregate writes of size 0-100 bytes." }
+        PNETCDF_VAR_SIZE_WRITE_AGG_100_1K:   { type: int, unit: count, desc: "Aggregate writes of size 100 B - 1 KiB." }
+        PNETCDF_VAR_SIZE_WRITE_AGG_1K_10K:   { type: int, unit: count, desc: "Aggregate writes of size 1 KiB - 10 KiB." }
+        PNETCDF_VAR_SIZE_WRITE_AGG_10K_100K: { type: int, unit: count, desc: "Aggregate writes of size 10 KiB - 100 KiB." }
+        PNETCDF_VAR_SIZE_WRITE_AGG_100K_1M:  { type: int, unit: count, desc: "Aggregate writes of size 100 KiB - 1 MiB." }
+        PNETCDF_VAR_SIZE_WRITE_AGG_1M_4M:    { type: int, unit: count, desc: "Aggregate writes of size 1 MiB - 4 MiB." }
+        PNETCDF_VAR_SIZE_WRITE_AGG_4M_10M:   { type: int, unit: count, desc: "Aggregate writes of size 4 MiB - 10 MiB." }
+        PNETCDF_VAR_SIZE_WRITE_AGG_10M_100M: { type: int, unit: count, desc: "Aggregate writes of size 10 MiB - 100 MiB." }
+        PNETCDF_VAR_SIZE_WRITE_AGG_100M_1G:  { type: int, unit: count, desc: "Aggregate writes of size 100 MiB - 1 GiB." }
+        PNETCDF_VAR_SIZE_WRITE_AGG_1G_PLUS:  { type: int, unit: count, desc: "Aggregate writes of size >= 1 GiB." }
+        PNETCDF_VAR_NDIMS:        { type: int, unit: count, desc: "Variable dimensionality." }
+        PNETCDF_VAR_NPOINTS:      { type: int, unit: count, desc: "Variable element count." }
+        PNETCDF_VAR_IS_RECORD_VAR: { type: int, unit: flag,  desc: "Record (unlimited-dim) variable." }
+
+# -----------------------------------------------------------------------------
+# STORAGE -- where the bytes landed (static layout, no I/O counts)
+# -----------------------------------------------------------------------------
+storage:
+  LUSTRE:
+    user_cares: "Whether striping matches the I/O pattern, and which OSTs are shared (contention)."
+    grain: "Per file record."
+    fields:
+      LUSTRE_STRIPE_SIZE:   { type: int,  unit: bytes, desc: "Stripe size." }
+      LUSTRE_STRIPE_WIDTH:  { type: int,  unit: count, desc: "Stripe count (OSTs the file spans)." }
+      LUSTRE_STRIPE_OFFSET: { type: int,  unit: id,    desc: "Starting OST index." }
+      LUSTRE_OSTS:          { type: int,  unit: count, desc: "Total OSTs in the filesystem." }
+      LUSTRE_MDTS:          { type: int,  unit: count, desc: "Total MDTs in the filesystem." }
+      # Indexed family: one counter per OST the file uses, i = 0 .. (LUSTRE_STRIPE_WIDTH - 1).
+      # Names are literal: LUSTRE_OST_ID_0, LUSTRE_OST_ID_1, LUSTRE_OST_ID_2, ...
+      LUSTRE_OST_ID_{i}:    { type: int,  unit: id,    indexed: "i = 0 .. LUSTRE_STRIPE_WIDTH-1", desc: "OST index of the i-th stripe (literal names LUSTRE_OST_ID_0, LUSTRE_OST_ID_1, ...); for contention analysis." }
+
+# -----------------------------------------------------------------------------
+# TRACES -- fine-grained, only present when explicitly enabled
+# -----------------------------------------------------------------------------
+traces:
+  DXT:
+    user_cares: "Exactly when and where every I/O happened -- timelines, bursts, per-OST mapping."
+    layer: "Darshan eXtended Tracing (DXT_POSIX, DXT_MPIIO). Not aggregated: one row per operation."
+    grain: "Per operation, per rank."
+    fields:
+      rank:       { type: int,    unit: id,            desc: "Issuing rank." }
+      hostname:   { type: string, unit: text,          desc: "Host that issued the op (build-dependent)." }
+      operation:  { type: enum,   unit: "read|write",  desc: "I/O direction." }
+      offset:     { type: int,    unit: bytes_offset,  desc: "Byte offset in file." }
+      length:     { type: int,    unit: bytes,         desc: "Bytes moved." }
+      start_time: { type: float,  unit: seconds,       desc: "Start (from job start)." }
+      end_time:   { type: float,  unit: seconds,       desc: "End (from job start)." }
+
+  HEATMAP:
+    user_cares: "Compact view of I/O intensity over time across ranks -- spot bursts and idle gaps without full DXT."
+    layer: "Time-binned rank x time intensity (per module: POSIX/MPIIO/STDIO)."
+    grain: "Per (rank, time-bin)."
+    fields:
+      nbins:         { type: int, unit: count, desc: "Number of time bins." }
+      bin_width_s:   { type: float, unit: seconds, desc: "Bin width." }
+      rank:          { type: int, unit: id,    desc: "Rank." }
+      bin_index:     { type: int, unit: count, desc: "Time-bin index." }
+      bytes_read:    { type: int, unit: bytes, desc: "Bytes read in this bin." }
+      bytes_written: { type: int, unit: bytes, desc: "Bytes written in this bin." }
+
+# -----------------------------------------------------------------------------
+# INSIGHTS -- derived answers (computed, not raw counters). These are what an
+# analysis agent typically reports; each notes the inputs it is derived from.
+# -----------------------------------------------------------------------------
+insights:
+  user_cares: "The bottom line: is this job's I/O healthy AT THIS SCALE, how close is it to what the system can do, and if not, why?"
+
+  # --- Raw achieved rates -----------------------------------------------------
+  throughput:
+    read_bandwidth_MiBps:    { unit: MiB/s,   from: "BYTES_READ / F_READ_TIME",              desc: "Effective read throughput." }
+    write_bandwidth_MiBps:   { unit: MiB/s,   from: "BYTES_WRITTEN / F_WRITE_TIME",          desc: "Effective write throughput." }
+    aggregate_bandwidth_MiBps: { unit: MiB/s, from: "(BYTES_READ+BYTES_WRITTEN) / (F_READ_TIME+F_WRITE_TIME)", desc: "Combined I/O throughput." }
+    metadata_rate_opsps:     { unit: ops/s,   from: "(insights.behavior.distinct_opens + POSIX_STATS + POSIX_SEEKS) / POSIX_F_META_TIME", desc: "Achieved metadata op rate. Uses distinct opens, not the raw POSIX_OPENS counter." }
+
+  # --- Pattern / behavior quality --------------------------------------------
+  behavior:
+    posix_io_coretime_share: { unit: ratio,   from: "POSIX (F_READ_TIME+F_WRITE_TIME+F_META_TIME) / (job.run_time * job.nprocs_total)", desc: "POSIX-only. Rank-seconds of I/O over rank-seconds available. STDIO/MPI-IO time is excluded and can exceed it." }
+    metadata_overhead:       { unit: ratio,   from: "POSIX F_META_TIME / POSIX total_io_time", desc: "POSIX-only. Time lost to opens/stats/seeks." }
+    small_access_ratio:      { unit: ratio,   from: "sum(SIZE_*_0_100, SIZE_*_100_1K, SIZE_*_1K_10K) / (READS + WRITES)", desc: "Fraction of accesses under 10 KiB (red flag)." }
+    sequential_ratio:        { unit: ratio,   from: "(SEQ_READS + SEQ_WRITES) / (READS + WRITES)", desc: "Sequential vs random access." }
+    unaligned_ratio:         { unit: ratio,   from: "FILE_NOT_ALIGNED / (READS + WRITES)",   desc: "Fraction of misaligned accesses." }
+    collective_ratio:        { unit: ratio,   from: "(COLL_READS+COLL_WRITES) / (COLL_READS+COLL_WRITES+INDEP_READS+INDEP_WRITES)", desc: "MPI-IO collective usage (higher is better at scale)." }
+    file_access_mode:        { unit: enum,    from: "record rank distribution",              desc: "shared-file | file-per-process | mixed." }
+    distinct_opens:          { unit: count,   from: "POSIX_OPENS - POSIX_FILENOS - POSIX_DUPS", desc: "Real open() calls, with the counters POSIX_OPENS folds in removed." }
+    redundant_open_ratio:    { unit: ratio,   from: "insights.behavior.distinct_opens / modules.POSIX_IO.n_files", desc: "Excessive re-opening of files." }
+
+  # --- Scale-aware: normalize achieved I/O by the run's shape ------------------
+  # These turn absolute counters into per-unit rates so a number can be judged
+  # against the run's layout (from the JOB section).
+  scale_normalized:
+    bytes_per_rank:          { unit: bytes,   from: "(BYTES_READ+BYTES_WRITTEN) / job.nprocs_total",        desc: "I/O volume carried per rank." }
+    bytes_per_node:          { unit: bytes,   from: "(BYTES_READ+BYTES_WRITTEN) / job.num_nodes",           desc: "I/O volume per node (pairs with per_node_bw)." }
+    bw_per_rank_MiBps:       { unit: MiB/s,   from: "aggregate_bandwidth_MiBps / job.nprocs_total",         desc: "Throughput contributed per rank." }
+    bw_per_node_MiBps:       { unit: MiB/s,   from: "aggregate_bandwidth_MiBps / job.num_nodes",            desc: "Throughput per node." }
+    opens_per_rank:          { unit: count,   from: "insights.behavior.distinct_opens / job.nprocs_total",                             desc: "Metadata pressure per rank (many ranks x many opens = MDS storm)." }
+
+  # --- Efficiency vs rated peak: the actual "is this good?" verdict -----------
+  # Requires system.rated_peak_performance. Each is achieved / reference-ceiling;
+  # ~1.0 means near hardware limit, low values indicate headroom / a problem.
+  efficiency:
+    read_bw_efficiency:      { unit: ratio,   from: "read_bandwidth_MiBps / (system.rated_peak_performance.measured_ior_bw or system.rated_peak_performance.peak_read_bw)",   desc: "Fraction of achievable read bandwidth realized." }
+    write_bw_efficiency:     { unit: ratio,   from: "write_bandwidth_MiBps / (system.rated_peak_performance.measured_ior_bw or system.rated_peak_performance.peak_write_bw)", desc: "Fraction of achievable write bandwidth realized." }
+    metadata_rate_efficiency: { unit: ratio,  from: "metadata_rate_opsps / system.rated_peak_performance.peak_metadata_rate",                    desc: "Fraction of the filesystem's metadata capacity used." }
+    node_bw_saturation:      { unit: ratio,   from: "bw_per_node_MiBps / system.rated_peak_performance.per_node_bw",                             desc: ">1 impossible; near 1 means node NIC/injection-bound, not FS-bound." }
+    io_bound_verdict:        { unit: enum,    from: "posix_io_coretime_share + metadata_overhead + small_access_ratio", desc: "healthy | metadata_bound | pattern_bound | io_intensive | unknown | unknown_non_posix_dominant (STDIO/MPI-IO time >1.25x POSIX, so a POSIX-derived ruling would cover a minority of the job's I/O)." }

@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "darshan-tools": {
+      "command": "darshan-tools-mcp",
+      "args": []
+    }
+  }
+}
